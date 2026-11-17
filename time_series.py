@@ -212,6 +212,7 @@ def plot_weekly(daily, df_orders):
     axes[0].set_ylabel("Revenue (thousands)")
     axes[0].legend()
     sns.heatmap(heat, cmap="YlOrRd", ax=axes[1], cbar_kws={"label": "Orders per day"})
+    axes[1].grid(False)   # no grid lines across the heatmap cells
     axes[1].set_title("Average orders per weekday and hour")
     plt.tight_layout()
     plt.show()

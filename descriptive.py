@@ -111,6 +111,22 @@ def plot_category_units(category_sales):
     plt.show()
 
 
+def category_revenue(df):
+    """Total revenue per category, highest first, with its share of the total revenue."""
+    revenue = df.groupby("Category")["Total"].sum().sort_values(ascending=False)
+    return pd.DataFrame({"Revenue": revenue.round(2), "Share of revenue": (revenue / revenue.sum()).map("{:.1%}".format)})
+
+
+def plot_category_revenue(category_revenue):
+    plt.figure(figsize=(10, 5))
+    sns.barplot(x=category_revenue["Revenue"].values / 1e6, y=category_revenue.index, color="green")
+    plt.title("Total Revenue by Category")
+    plt.xlabel("Revenue (millions)")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_top_per_category(df, category_sales, n=5):
     """Top n products in each category; the title shows their share of the category's units."""
     product_sales = df.groupby(["Category", "Item Desc"])["Quantity"].sum()

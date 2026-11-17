@@ -212,6 +212,7 @@ def plot_daily_category_correlation(df):
     corr = daily.corr(method="spearman")
     plt.figure(figsize=(7, 5))
     sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", vmin=-1, vmax=1)
+    plt.gca().grid(False)   # no grid lines across the heatmap cells
     plt.title("Correlation of daily revenue between categories")
     plt.tight_layout()
     plt.show()
