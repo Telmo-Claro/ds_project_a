@@ -1,0 +1,6 @@
+# Python cache files, created automatically when the modules are imported
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

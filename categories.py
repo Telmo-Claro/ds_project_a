@@ -1,8 +1,12 @@
-"""Step 6 - Category performance, relationships, anomalies and statistical tests."""
+"""Step 6 - Category performance, relationships and anomalies."""
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+import plot_style  # noqa: F401 (applies the shared plot style)
+from features import NEW_MENU_START
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 from scipy import stats
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -39,33 +43,34 @@ def category_performance(df, orders):
     table["Units share"] = table["Units"] / table["Units"].sum()
     table["Revenue share"] = table["Revenue"] / table["Revenue"].sum()
     table["Revenue per unit"] = table["Revenue"] / table["Units"]
-    table["Revenue per product"] = table["Revenue"] / table["Products"]
+    # Products are on sale for very different lengths of time (Step 6.2), so we divide by the
+    # total time the category's products were on sale, not by the number of products
+    days_on_sale = product_lifecycle(df).groupby("Category")["Days on sale"].sum()
+    table["Revenue per product per month"] = table["Revenue"] / days_on_sale * 30
     table["% of orders"] = table["Orders"] / n_orders
     return table.sort_values("Revenue", ascending=False)
 
 
 def show_category_performance(table):
-    """The performance table with readable formatting."""
-    out = table.drop(columns="Orders").copy()
-    for col in ["Units share", "Revenue share", "% of orders"]:
-        out[col] = out[col].map("{:.1%}".format)
-    for col in ["Revenue", "Revenue per unit", "Revenue per product"]:
+    """Price level and menu efficiency per category (units, revenue and shares are in Steps 4.5-4.6)."""
+    out = table[["Revenue per unit", "Products", "Revenue per product per month"]].copy()
+    for col in ["Revenue per unit", "Revenue per product per month"]:
         out[col] = out[col].map("{:,.0f}".format)
     return out
 
 
 def plot_category_performance(table):
-    shares = table[["Units share", "Revenue share"]] * 100
+    """Revenue per unit (price level) and revenue per product per month on sale (how much a menu item earns)."""
     fig, axes = plt.subplots(1, 2, figsize=(18, 5))
-    shares.plot.barh(ax=axes[0], color=["steelblue", "darkgreen"])
-    axes[0].invert_yaxis()
-    axes[0].set_title("Share of units vs share of revenue")
-    axes[0].set_xlabel("%")
-    axes[0].set_ylabel("")
-    axes[1].barh(table.index, table["Revenue per unit"], color="darkorange")
-    axes[1].invert_yaxis()
-    axes[1].set_title("Average revenue per unit sold")
-    axes[1].set_xlabel("Revenue per unit")
+    axes[0].barh(table.index, table["Revenue per unit"], color="darkgreen")
+    axes[0].set_title("Average revenue per unit sold")
+    axes[0].set_xlabel("Revenue per unit")
+    axes[1].barh(table.index, table["Revenue per product per month"] / 1000, color="darkgreen")
+    axes[1].set_title("Revenue per product, per month on sale")
+    axes[1].set_xlabel("Revenue per product per month (in thousands)")
+    for ax in axes:
+        ax.invert_yaxis()
+        ax.set_ylabel("")
     plt.tight_layout()
     plt.show()
 
@@ -78,16 +83,84 @@ def product_revenue(df):
 
 
 def pareto_summary(df):
-    """How concentrated is revenue: how many products make 50/80/95% of it, and how long is the tail."""
+    """How concentrated is revenue: how many products make 50/80/95% of it."""
     products = product_revenue(df)
     cum_share = products["Revenue"].cumsum() / products["Revenue"].sum()
     n = len(products)
     rows = {f"Products making {p:.0%} of revenue": (cum_share < p).sum() + 1 for p in [0.5, 0.8, 0.95]}
     rows = {k: f"{v} ({v / n:.0%} of products)" for k, v in rows.items()}
-    rare = products["Units"] < 12
-    rows["Products sold less than once a month (< 12 units)"] = f"{rare.sum()} ({rare.mean():.0%} of products)"
-    rows["Revenue of those rare products"] = f"{products.loc[rare, 'Revenue'].sum() / products['Revenue'].sum():.1%}"
     return pd.Series(rows).to_frame("Value")
+
+
+# Product lifecycle. We only see sales, not the menu, so the time between a product's first and
+# last sale is our best estimate of how long it was on sale.
+LIFECYCLE = ["Regular", "New (from Jan 2011)", "Retired (before Jan 2011)", "Special (sold within a week)"]
+ONCE_A_MONTH, ONCE_A_WEEK = 1 / 30, 1 / 7   # units per day on sale
+
+
+def product_lifecycle(df):
+    """One row per product: when it was sold, for how long, how fast, and its lifecycle status:
+    - Special: all its sales fall within 7 days (New Year's Eve, Christmas, ...)
+    - New: first sold from the start of the new menu (7 Jan 2011)
+    - Retired: last sold before the new menu
+    - Regular: on sale before and after the new menu started"""
+    products = df.groupby("Item Desc").agg(Category=("Category", "first"), Units=("Quantity", "sum"),
+                                           Revenue=("Total", "sum"), First_sale=("Date", "min"),
+                                           Last_sale=("Date", "max"))
+    products["Days on sale"] = (products["Last_sale"] - products["First_sale"]).dt.days + 1
+    products["Units per day"] = products["Units"] / products["Days on sale"]
+    regular, new, retired, special = LIFECYCLE
+    products["Status"] = np.select(
+        [products["Days on sale"] <= 7, products["First_sale"] >= NEW_MENU_START, products["Last_sale"] < NEW_MENU_START],
+        [special, new, retired], regular)
+    products["Status"] = pd.Categorical(products["Status"], categories=LIFECYCLE, ordered=True)
+    return products
+
+
+def lifecycle_summary(lifecycle):
+    """Per lifecycle status: number of products, share of the café's revenue, typical time on sale
+    and sales speed, and how many of them sold fewer than 12 units in the whole year."""
+    total = lifecycle["Revenue"].sum()
+    table = lifecycle.groupby("Status", observed=True).agg(
+        products=("Units", "size"),
+        revenue=("Revenue", "sum"),
+        days=("Days on sale", "median"),
+        speed=("Units per day", "median"),
+        under_12=("Units", lambda u: (u < 12).sum()),
+    )
+    table["revenue"] = (table["revenue"] / total).map("{:.1%}".format)
+    table["speed"] = table["speed"].round(2)
+    table.columns = ["Products", "Share of the café's revenue", "Typical days on sale (median)",
+                     "Typical units sold per day on sale (median)", "Products with fewer than 12 units in the year"]
+    return table
+
+
+def slow_sellers(lifecycle):
+    """Products still on the menu in 2011 (regular or new) that sell slowly per day on sale, per category."""
+    menu = lifecycle[lifecycle["Status"].isin(LIFECYCLE[:2])]
+    total = lifecycle["Revenue"].sum()
+    weekly = menu[menu["Units per day"] < ONCE_A_WEEK]
+    monthly = menu[menu["Units per day"] < ONCE_A_MONTH]
+    on_menu, slow_week, slow_month = "Products on the 2011 menu", "Sell less than once a week", "Sell less than once a month"
+    revenue = "Café revenue from the products selling less than once a week"
+    table = pd.DataFrame({
+        on_menu: menu.groupby("Category").size(),
+        slow_week: weekly.groupby("Category").size(),
+        slow_month: monthly.groupby("Category").size(),
+        revenue: weekly.groupby("Category")["Revenue"].sum() / total,
+    }).fillna(0).sort_values(slow_week, ascending=False)
+    table.loc["Total"] = table.sum()
+    table[[on_menu, slow_week, slow_month]] = table[[on_menu, slow_week, slow_month]].astype(int)
+    table[revenue] = table[revenue].map("{:.2%}".format)
+    return table
+
+
+def slowest_products(lifecycle, categories=("BEVERAGE", "FOOD"), n=10):
+    """The slowest products still on the menu in 2011 in the given categories."""
+    menu = lifecycle[lifecycle["Status"].isin(LIFECYCLE[:2]) & lifecycle["Category"].isin(categories)]
+    out = menu.nsmallest(n, "Units per day")[["Category", "Status", "Units", "Days on sale", "Units per day"]]
+    out["Units per day"] = out["Units per day"].round(3)
+    return out.rename(columns={"Units": "Units sold in the year", "Units per day": "Units sold per day on sale"})
 
 
 def plot_pareto(df):
@@ -144,6 +217,48 @@ def daypart_table(df, orders):
     return table
 
 
+def _weekday(df):
+    """Weekday name of every row, as an ordered category (Mon-Sun)."""
+    names = df["Date"].dt.day_of_week.map(dict(enumerate(DAY_NAMES)))
+    return pd.Series(pd.Categorical(names, categories=DAY_NAMES, ordered=True), index=df.index, name="Weekday")
+
+
+def product_mix(df, category, by, n=7):
+    """How the n best-selling products of a category (over the whole year) split their units
+    for every value of `by` (e.g. Daypart, weekday). Each row adds up to 100% of those n products."""
+    sales = df[df["Category"] == category]
+    top = sales.groupby("Item Desc")["Quantity"].sum().nlargest(n).index
+    sales = sales[sales["Item Desc"].isin(top)]
+    by = by.loc[sales.index] if isinstance(by, pd.Series) else by
+    mix = sales.groupby([by, "Item Desc"], observed=True)["Quantity"].sum().unstack().fillna(0)
+    mix = mix[list(top)]   # best seller first (bottom of the bar)
+    return mix.div(mix.sum(axis=1), axis=0)
+
+
+def plot_top_product_mix(df, categories=("BEVERAGE", "FOOD", "TOBACCO"), n=7):
+    """Like the category mix in Step 6.3, but for the top n products inside each category:
+    one row per category, by part of the day (left) and by weekday (right). Shares of 5% or more are labelled."""
+    weekday = _weekday(df)
+    fig, axes = plt.subplots(len(categories), 2, figsize=(20, 6 * len(categories)))
+    for row, category in zip(axes, categories):
+        by_daypart = product_mix(df, category, "Daypart", n)
+        by_weekday = product_mix(df, category, weekday, n)
+        colors = sns.color_palette("tab10", n)   # one fixed colour per product in both panels
+        for ax, mix, title in [(row[0], by_daypart, f"{category}: top {n} products by part of the day"),
+                               (row[1], by_weekday, f"{category}: top {n} products by weekday")]:
+            (mix * 100).plot.bar(stacked=True, ax=ax, width=0.8, color=colors, edgecolor="white", legend=False)
+            for bars in ax.containers:
+                ax.bar_label(bars, labels=[f"{b.get_height():.0f}%" if b.get_height() >= 5 else "" for b in bars],
+                             label_type="center", fontsize=9)
+            ax.set_title(title)
+            ax.set_ylabel(f"% of the top {n} products' units")
+            ax.set_xlabel("")
+            ax.tick_params(axis="x", rotation=20)
+        row[1].legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------------- 6.4 Most sold products per month and season
 
 def top_products_per_period(df, periods, n=3):
@@ -176,23 +291,139 @@ def season_changes(df, n=8):
     return pd.concat([out.nlargest(n, "Change (pp)"), out.nsmallest(n, "Change (pp)")])
 
 
+def _product_colors(df, n=10):
+    """One fixed colour per product, by its rank in the whole year, so a product looks the same in every chart."""
+    top = df.groupby("Item Desc")["Quantity"].sum().nlargest(n).index
+    return dict(zip(top, sns.color_palette("tab10", n)))
+
+
+def plot_top_products_per_month(df, n=4):
+    """Grouped bars: units per month of the n best-selling products of the year."""
+    month = df["Date"].dt.to_period("M")
+    top = df.groupby("Item Desc")["Quantity"].sum().nlargest(n).index
+    units = df[df["Item Desc"].isin(top)].pivot_table(index=month, columns="Item Desc", values="Quantity",
+                                                       aggfunc="sum")[list(top)]
+    leader = df.groupby([month, "Item Desc"])["Quantity"].sum().groupby(level=0).idxmax().str[1]
+    wins = (leader == top[0]).sum()
+    units.index = units.index.strftime("%b %y")
+    colors = _product_colors(df)
+    ax = units.plot.bar(figsize=(16, 5), width=0.8, color=[colors[p] for p in top], edgecolor="white", rot=0)
+    ax.set_title(f"{top[0].title()} is the best seller in {wins} of the {len(units)} months")
+    ax.set_ylabel("Units sold")
+    ax.set_xlabel("")
+    ax.legend(title="", loc="upper left", bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_top_products_per_season(df, n=5):
+    """One panel per season with its n best-selling products; every product keeps the same colour in all panels."""
+    season = season_of(df["Date"])
+    units = df.groupby([season, "Item Desc"], observed=True)["Quantity"].sum()
+    tops = {s: units[s].nlargest(n) for s in SEASONS}
+    colors = _product_colors(df)
+    fig, axes = plt.subplots(1, len(SEASONS), figsize=(22, 4.5), sharex=True)
+    for ax, (name, top) in zip(axes, tops.items()):
+        bars = ax.barh(top.index, top.values, color=[colors[p] for p in top.index])
+        ax.bar_label(bars, fmt="{:,.0f}", padding=3, fontsize=9)
+        ax.invert_yaxis()
+        ax.set_title(name)
+        ax.set_xlabel("Units sold")
+        ax.tick_params(axis="y", labelsize=9)
+    axes[0].set_xlim(0, max(top.max() for top in tops.values()) * 1.2)
+    fig.suptitle(f"Top {n} products per season: the same favourites all year", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_season_changes(changes):
+    """Diverging bars: change in share of units from Apr-Jun to Oct-Mar (green = gains, red = loses)."""
+    data = changes["Change (pp)"].sort_values()
+    colors = ["tab:red" if v < 0 else "tab:green" for v in data]
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bars = ax.barh(data.index, data.values, color=colors)
+    ax.bar_label(bars, labels=[f"{v:+.2f}" for v in data], padding=3, fontsize=9)
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set_xlim(data.min() * 1.3, data.max() * 1.6)
+    ax.set_title("Apr-Jun -> Oct-Mar: cold drinks lose share, beer, chai and poutine gain")
+    ax.set_xlabel("Change in share of all units sold (percentage points)")
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------------- 6.5 Relationships
 
 def price_vs_units(df):
-    """One point per product: median price and units sold (products with a real price only)."""
-    products = df[df["Rate"] >= 1].groupby("Item Desc").agg(Price=("Rate", "median"), Units=("Quantity", "sum"),
-                                                          Category=("Category", "first"))
-    return products
+    """One point per product: median price and units sold per day on sale (Step 6.2).
+    One-week specials are left out: they sell a lot in a few days, which says nothing about their price."""
+    lifecycle = product_lifecycle(df)
+    regular = lifecycle[lifecycle["Status"] != LIFECYCLE[3]]
+    price = df[df["Rate"] >= 1].groupby("Item Desc")["Rate"].median()   # products with a real price only
+    products = regular[["Category", "Units per day"]].join(price.rename("Price"), how="inner")
+    return products.rename(columns={"Units per day": "Units"})
+
+
+def _category_colors(categories):
+    """One fixed colour per category, so a category looks the same in the overall and per-category plots."""
+    order = MAIN_CATEGORIES + sorted(c for c in set(categories) if c not in MAIN_CATEGORIES)
+    return dict(zip(order, sns.color_palette("tab10", len(order))))
+
+
+def _plain_log_axes(ax):
+    """Log scales on both axes, with plain numbers (20, 50, 100, ...) instead of 2x10^1."""
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+        axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        axis.set_minor_formatter(NullFormatter())
+
+
+def _p_text(p):
+    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
+
+
+def _add_trend_line(ax, price, units, color="black"):
+    """Straight-line fit of log(units) on log(price), drawn as a dashed line.
+    On log-log axes this is a straight line; it's a visual guide, the Spearman rho is the actual measure."""
+    slope, intercept = np.polyfit(np.log10(price), np.log10(units), 1)
+    x = np.logspace(np.log10(price.min()), np.log10(price.max()), 50)
+    ax.plot(x, 10 ** intercept * x ** slope, color=color, linestyle="--", linewidth=2, label="Trend line")
 
 
 def plot_price_vs_units(products):
     rho, p = stats.spearmanr(products["Price"], products["Units"])
     plt.figure(figsize=(10, 6))
-    sns.scatterplot(data=products, x="Price", y="Units", hue="Category", alpha=0.7)
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.title(f"Price vs units sold per product (Spearman rho = {rho:.2f}, p = {p:.1e})")
+    sns.scatterplot(data=products, x="Price", y="Units", hue="Category", alpha=0.7,
+                    palette=_category_colors(products["Category"]))
+    _add_trend_line(plt.gca(), products["Price"], products["Units"])
+    _plain_log_axes(plt.gca())
+    plt.xlabel("Price")
+    plt.ylabel("Units sold per day on sale")
+    plt.title(f"Price vs units sold per day per product (Spearman rho = {rho:.2f}, {_p_text(p)})")
     plt.legend(loc="upper left", bbox_to_anchor=(1, 1))
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_price_vs_units_by_category(products):
+    """One scatter per main category, with its Spearman rho and p-value in the title (log scales)."""
+    colors = _category_colors(products["Category"])
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    for ax, category in zip(axes.flat, MAIN_CATEGORIES):
+        group = products[products["Category"] == category]
+        rho, p = stats.spearmanr(group["Price"], group["Units"])
+        ax.scatter(group["Price"], group["Units"], color=colors[category], alpha=0.7, edgecolor="white")
+        _add_trend_line(ax, group["Price"], group["Units"])
+        _plain_log_axes(ax)
+        verdict = "significant" if p < 0.05 else "not significant"
+        ax.set_title(f"{category} ({len(group)} products)\nrho = {rho:+.2f}, {_p_text(p)} ({verdict})")
+        ax.set_xlabel("Price")
+        ax.set_ylabel("Units sold per day on sale")
+    for ax in axes.flat[len(MAIN_CATEGORIES):]:
+        ax.axis("off")
+    fig.suptitle("Price vs units sold per day, per category (rho < 0: cheaper sells more, rho > 0: pricier sells more)",
+                 fontsize=14)
     plt.tight_layout()
     plt.show()
 
@@ -266,51 +497,3 @@ def first_sale_dates(df, month="2011-01"):
     """Dates on which new products were sold for the first time in a given month."""
     first = df.groupby("Item Desc")["Date"].min()
     return first[first.dt.strftime("%Y-%m") == month].value_counts().sort_index().head(5)
-
-
-# ---------------------------------------------------------------- 6.7 Statistical tests
-
-def test_weekend_vs_weekday(business_daily):
-    """Mann-Whitney U: is revenue on Fri/Sat nights higher than on Sun-Thu? (business days, non-normal data)"""
-    is_weekend = business_daily.index.day_of_week.isin([4, 5])
-    weekend, weekday = business_daily[is_weekend], business_daily[~is_weekend]
-    u, p = stats.mannwhitneyu(weekend, weekday, alternative="greater")
-    return pd.Series({"Test": "Mann-Whitney U (one-sided)",
-                      "H0": "Fri/Sat business days make the same revenue as Sun-Thu",
-                      "Median Fri/Sat": f"{weekend.median():,.0f}", "Median Sun-Thu": f"{weekday.median():,.0f}",
-                      "Effect size (rank-biserial r)": f"{2 * u / (len(weekend) * len(weekday)) - 1:.2f}",
-                      "p-value": f"{p:.1e}"})
-
-
-def test_weekdays(business_daily):
-    """Kruskal-Wallis: does revenue differ between the 7 weekdays?"""
-    groups = [g.values for _, g in business_daily.groupby(business_daily.index.day_of_week)]
-    h, p = stats.kruskal(*groups)
-    return pd.Series({"Test": "Kruskal-Wallis H", "H0": "All weekdays have the same revenue distribution",
-                      "H statistic": f"{h:.1f}", "p-value": f"{p:.1e}"})
-
-
-def test_drink_type_vs_season(beverages):
-    """Chi-square test of independence: does the hot/cold choice depend on the season?"""
-    hot_cold = beverages[beverages["Drink type"] != "Other"]
-    table = pd.crosstab(season_of(hot_cold["Date"]), hot_cold["Drink type"], values=hot_cold["Quantity"], aggfunc="sum")
-    chi2, p, dof, _ = stats.chi2_contingency(table)
-    cramers_v = np.sqrt(chi2 / (table.values.sum() * (min(table.shape) - 1)))
-    return pd.Series({"Test": "Chi-square test of independence", "H0": "Hot/cold choice is the same in every season",
-                      "Chi2": f"{chi2:,.0f}", "Degrees of freedom": dof,
-                      "Effect size (Cramer's V)": f"{cramers_v:.2f}", "p-value": f"{p:.1e}"}), table
-
-
-def test_order_value_by_daypart(orders):
-    """Kruskal-Wallis: does the order value differ between parts of the day?"""
-    groups = [g["Total"].values for _, g in orders.groupby("Daypart", observed=True)]
-    h, p = stats.kruskal(*groups)
-    medians = orders.groupby("Daypart", observed=True)["Total"].median()
-    return pd.Series({"Test": "Kruskal-Wallis H", "H0": "Order value is the same in every part of the day",
-                      "Lowest median": f"{medians.idxmin()} ({medians.min():,.0f})",
-                      "Highest median": f"{medians.idxmax()} ({medians.max():,.0f})",
-                      "H statistic": f"{h:.1f}", "p-value": f"{p:.1e}"})
-
-
-def test_summary(*tests):
-    return pd.DataFrame({t["Test"] + ": " + t["H0"]: t.drop(["Test", "H0"]) for t in tests}).T.fillna("")
