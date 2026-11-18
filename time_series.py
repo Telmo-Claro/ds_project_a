@@ -4,10 +4,14 @@ All calculations and plots for Step 5 of main.ipynb live here, so the notebook
 can focus on the insights. Functions named `plot_*` draw a figure, the others
 return a pandas object.
 """
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+import plot_style  # noqa: F401 (applies the shared plot style)
 from statsmodels.tsa.stattools import adfuller
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -89,6 +93,74 @@ def trend_summary(daily, ma):
         "Average day Jan-Mar 2011": f"{last_q:,.0f}",
         "Growth": f"{last_q / first_q - 1:+.0%}",
     }).to_frame("Value")
+
+
+def _growth_parts(df_copy, df_orders, period):
+    """Revenue per day split into its three drivers, per period:
+    revenue per day = orders per day x items per order x price per item."""
+    lines = df_copy.groupby(df_copy["Date"].dt.to_period(period))
+    orders = df_orders.groupby(df_orders["Date"].dt.to_period(period))
+    days = lines["Date"].nunique()
+    n_orders = orders.size()
+    items = lines["Quantity"].sum()
+    revenue = lines["Total"].sum()
+    return pd.DataFrame({
+        "Revenue per day": revenue / days,
+        "Orders per day": n_orders / days,
+        "Items per order": items / n_orders,
+        "Price per item": revenue / items,
+    })
+
+
+def growth_breakdown(df_copy, df_orders):
+    """The growth drivers per quarter, and the change from the first to the last quarter."""
+    table = _growth_parts(df_copy, df_orders, "Q")
+    table.index = ["Apr-Jun 2010", "Jul-Sep 2010", "Oct-Dec 2010", "Jan-Mar 2011"]
+    change = (table.iloc[-1] / table.iloc[0] - 1).map("{:+.1%}".format)
+    out = table.round({"Revenue per day": 0, "Orders per day": 1, "Items per order": 2, "Price per item": 1})
+    out = out.astype(object)
+    out.loc["Change (first -> last quarter)"] = change
+    return out
+
+
+def same_product_price_change(df_copy):
+    """How much more the same products cost in Jan-Mar 2011 than in Apr-Jun 2010.
+    Each product's price change is weighted by its units in Apr-Jun 2010 (a Laspeyres price index),
+    so a change in what customers buy (the mix) doesn't count as a price change."""
+    first = df_copy[df_copy["Date"] < "2010-07-01"].groupby("Item Desc")[["Total", "Quantity"]].sum()
+    last = df_copy[df_copy["Date"] >= "2011-01-01"].groupby("Item Desc")[["Total", "Quantity"]].sum()
+    both = first.index.intersection(last.index)
+    price_first = first.loc[both, "Total"] / first.loc[both, "Quantity"]
+    price_last = last.loc[both, "Total"] / last.loc[both, "Quantity"]
+    weights = first.loc[both, "Quantity"]
+    index = (price_last * weights).sum() / (price_first * weights).sum()
+    return pd.Series({
+        "Products sold in both quarters": f"{len(both)}",
+        "Their share of Jan-Mar 2011 units": f"{last.loc[both, 'Quantity'].sum() / last['Quantity'].sum():.0%}",
+        "Products whose price changed (> 1%)": f"{((price_last / price_first - 1).abs() > 0.01).sum()}",
+        "Price change of the same products": f"{index - 1:+.1%}",
+    }).to_frame("Value")
+
+
+def plot_growth_drivers(df_copy, df_orders):
+    """Monthly revenue per day, orders per day and average order value, indexed to April 2010 = 100,
+    so the three can share one axis."""
+    parts = _growth_parts(df_copy, df_orders, "M")
+    parts["Avg order value"] = parts["Revenue per day"] / parts["Orders per day"]
+    lines = {"Revenue per day": "black", "Orders per day": "steelblue", "Avg order value": "darkorange"}
+    indexed = parts[list(lines)] / parts[list(lines)].iloc[0] * 100
+    months = indexed.index.strftime("%b %y")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for name, color in lines.items():
+        ax.plot(months, indexed[name], marker="o", color=color, linewidth=2, label=name)
+        ax.annotate(f"{indexed[name].iloc[-1]:.0f}", (len(months) - 1, indexed[name].iloc[-1]),
+                    xytext=(8, 0), textcoords="offset points", va="center", color=color)
+    ax.axhline(100, color="gray", linewidth=1, linestyle="--")
+    ax.set_title("Until December more orders drove growth; since then higher order values hold revenue up")
+    ax.set_ylabel("Index (Apr 2010 = 100)")
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+    plt.show()
 
 
 # ---------------------------------------------------------------- 5.2 Decomposition
@@ -253,10 +325,17 @@ def plot_drinks_per_month(table):
     axes[0].set_title("Hot vs cold drinks sold per month")
     axes[0].set_ylabel("Units sold")
     axes[0].legend()
-    axes[1].bar(labels, table["Cold share"] * 100, color="tab:blue")
-    axes[1].axhline(50, color="gray", linestyle="--")
-    axes[1].set_title("Cold drinks as % of hot + cold drinks")
-    axes[1].set_ylabel("%")
+    # Right: out of every 100 hot or cold drinks sold that month, how many were cold. Unlike the counts on
+    # the left, this doesn't depend on how busy the month was, so it shows the customers' choice.
+    share = table["Cold share"] * 100
+    bars = axes[1].bar(labels, share, color="tab:blue")
+    axes[1].bar_label(bars, fmt="%.0f%%", padding=2, fontsize=9)
+    axes[1].axhline(50, color="gray", linestyle="--", label="50% = as many hot as cold drinks")
+    axes[1].legend(loc="upper right")
+    axes[1].set_title(f"Cold drinks go from {share.max():.0f}% of drinks in {share.idxmax():%B} "
+                      f"to {share.min():.0f}% in {share.idxmin():%B}")
+    axes[1].set_ylabel("% of hot + cold drinks that were cold")
+    axes[1].set_ylim(0, 80)
     for ax in axes:
         ax.tick_params(axis="x", rotation=45)
     plt.tight_layout()
@@ -282,7 +361,7 @@ def plot_differencing(series):
         scale, unit = (1, "Log points") if name.startswith("Log") else (1000, "Thousands")
         ax.plot(s.index, s / scale, color="lightgray", label=name)
         ax.plot(s.index, s.rolling(30).mean() / scale, color="red", label="30-day rolling mean")
-        ax.plot(s.index, s.rolling(30).std() / scale, color="steelblue", label="30-day rolling std")
+        ax.plot(s.index, s.rolling(30).std() / scale, color="steelblue", label="30-day rolling standard deviation")
         ax.set_ylabel(unit)
         ax.set_title(name)
         ax.legend(loc="upper left")
@@ -295,11 +374,16 @@ def stationarity_check(s):
     plus the Augmented Dickey-Fuller test (H0: the series has a unit root, i.e. is NOT stationary)."""
     s = s.dropna()
     first, second = s.iloc[: len(s) // 2], s.iloc[len(s) // 2:]
+    # statsmodels >= 0.15 warns that adfuller will return an object instead of a tuple; the p-value
+    # is still element [1], and the new option doesn't exist in 0.14 (requirements.txt), so we just mute it
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        adf_p = adfuller(s, autolag="AIC")[1]
     return pd.Series({"Mean 1st half": first.mean(), "Mean 2nd half": second.mean(),
                       "Std 1st half": first.std(), "Std 2nd half": second.std(),
                       "Std ratio (2nd / 1st half)": second.std() / first.std(),
                       "Autocorrelation lag 1": s.autocorr(1), "Autocorrelation lag 7": s.autocorr(7),
-                      "ADF p-value": adfuller(s, autolag="AIC")[1]})
+                      "ADF p-value": adf_p})
 
 
 def stationarity_table(series):
