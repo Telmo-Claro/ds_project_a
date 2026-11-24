@@ -141,38 +141,43 @@ def run_apriori_pairs(
     return out
 
 
-def main() -> None:
-    print_apriori_explanation()
+DAYPART_ORDER = [
+    "Late morning (10-12h)",
+    "Lunch (12-15h)",
+    "Afternoon (15-19h)",
+    "Evening (19-23h)",
+    "Night (23-03h)",
+]
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(base_dir, "data", "cafe_clean_lines.csv")
+# Project folders (this file lives in scripts/, the data and outputs are next to it)
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "outputs")
 
+
+def load_mba_lines(csv_path: str = os.path.join(DATA_DIR, "cafe_clean_lines.csv")) -> pd.DataFrame:
+    """Loads the cleaned line data and removes the non-bundle noise (add-ons and merchandise)."""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"File not found at: {csv_path}. Please verify that 'cafe_clean_lines.csv' is inside the 'data' folder."
         )
-
     df = pd.read_csv(csv_path)
-    df_clean = df[
+    return df[
         df["Base product"].notna()
         & (df["Base product"] != "ADD ON S")
         & (df["Category"] != "MERCHANDISE")
     ].copy()
 
-    # 1. Overall Apriori analysis
-    overall = run_apriori_pairs(df_clean, min_support=0.003, min_lift=1.15, min_bills_floor=25)
-    print(f"Total overall rules found: {len(overall)}")
 
-    # 2. Daypart Apriori analysis (5 dayparts)
-    daypart_order = [
-        "Late morning (10-12h)",
-        "Lunch (12-15h)",
-        "Afternoon (15-19h)",
-        "Evening (19-23h)",
-        "Night (23-03h)",
-    ]
+def run_overall(df_clean: pd.DataFrame) -> pd.DataFrame:
+    """Apriori pairs over all bills of the year."""
+    return run_apriori_pairs(df_clean, min_support=0.003, min_lift=1.15, min_bills_floor=25)
+
+
+def run_by_daypart(df_clean: pd.DataFrame) -> pd.DataFrame:
+    """Apriori pairs per daypart, ranked by lift; rank #1 is the best deal of that daypart."""
     daypart_list = []
-    for dp in daypart_order:
+    for dp in DAYPART_ORDER:
         grp = df_clean[df_clean["Daypart"] == dp]
         res = run_apriori_pairs(grp, min_support=0.004, min_lift=1.15, min_bills_floor=10)
         if not res.empty:
@@ -180,41 +185,64 @@ def main() -> None:
             res["rank_in_daypart"] = range(1, len(res) + 1)
             res["recommendation_tag"] = np.where(res["rank_in_daypart"] == 1, "BEST DEAL", "Runner-up")
             daypart_list.append(res)
+    return pd.concat(daypart_list, ignore_index=True) if daypart_list else pd.DataFrame()
 
-    by_daypart = pd.concat(daypart_list, ignore_index=True) if daypart_list else pd.DataFrame()
+
+TOP_COLUMNS = [
+    "daypart",
+    "recommendation_tag",
+    "anchor_product",
+    "addon_product",
+    "bills_together",
+    "support_pct",
+    "conf_anchor_to_addon_pct",
+    "lift",
+    "sum_rate",
+]
+
+
+def top_per_daypart(by_daypart: pd.DataFrame, n: int = 3) -> pd.DataFrame:
+    """The n best combo candidates of every daypart."""
+    if by_daypart.empty:
+        return by_daypart
+    return by_daypart[by_daypart["rank_in_daypart"] <= n][TOP_COLUMNS].reset_index(drop=True)
+
+
+def save_results(overall: pd.DataFrame, by_daypart: pd.DataFrame, out_dir: str = OUTPUT_DIR) -> list:
+    """Exports the overall and per-daypart rules as CSV files and returns their paths."""
+    os.makedirs(out_dir, exist_ok=True)
+    out_overall = os.path.join(out_dir, "apriori_combideals_overall_en.csv")
+    out_daypart = os.path.join(out_dir, "apriori_combideals_per_daypart_en.csv")
+    overall.to_csv(out_overall, index=False, encoding="utf-8-sig")
+    paths = [out_overall]
+    if not by_daypart.empty:
+        by_daypart.to_csv(out_daypart, index=False, encoding="utf-8-sig")
+        paths.append(out_daypart)
+    return paths
+
+
+def main() -> None:
+    print_apriori_explanation()
+
+    df_clean = load_mba_lines()
+
+    # 1. Overall Apriori analysis
+    overall = run_overall(df_clean)
+    print(f"Total overall rules found: {len(overall)}")
+
+    # 2. Daypart Apriori analysis (5 dayparts)
+    by_daypart = run_by_daypart(df_clean)
     print(f"Total daypart rules found: {len(by_daypart)}\n")
 
     print("=== TOP 3 COMBO CANDIDATES PER DAYPART (RANK #1 = BEST DEAL) ===")
     if not by_daypart.empty:
-        top_dp = by_daypart[by_daypart["rank_in_daypart"] <= 3]
-        print(
-            top_dp[
-                [
-                    "daypart",
-                    "recommendation_tag",
-                    "anchor_product",
-                    "addon_product",
-                    "bills_together",
-                    "support_pct",
-                    "conf_anchor_to_addon_pct",
-                    "lift",
-                    "sum_rate",
-                ]
-            ].to_string(index=False)
-        )
+        print(top_per_daypart(by_daypart).to_string(index=False))
         print()
 
     # 3. Export clean English CSVs for notebook and reporting
-    out_overall = os.path.join(base_dir, "apriori_combideals_overall_en.csv")
-    out_daypart = os.path.join(base_dir, "apriori_combideals_per_daypart_en.csv")
-
-    overall.to_csv(out_overall, index=False, encoding="utf-8-sig")
-    if not by_daypart.empty:
-        by_daypart.to_csv(out_daypart, index=False, encoding="utf-8-sig")
-
     print("Export completed:")
-    print("-", out_overall)
-    print("-", out_daypart)
+    for path in save_results(overall, by_daypart):
+        print("-", path)
 
 
 if __name__ == "__main__":
